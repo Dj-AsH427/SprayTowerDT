@@ -63,11 +63,12 @@ hr { margin: 0.6rem 0 1rem 0; }
 # ─────────────────────────────────────────────────────────────────────────
 # LOAD ARTIFACTS
 # ─────────────────────────────────────────────────────────────────────────
-@st.cache_resource
+@st.cache_data
 def load_artifacts():
     artifact = joblib.load(os.path.join(APP_DIR, "model_artifact.pkl"))
     sample = pd.read_pickle(os.path.join(APP_DIR, "sample_data.pkl"))
     sample = sample.sort_values("Time and date").reset_index(drop=True)
+    sample['month'] = sample['Time and date'].dt.to_period('M')
     return artifact, sample
 
 
@@ -270,25 +271,58 @@ with st.sidebar:
     st.markdown("### 🌡️ Grey-Box Spray Dryer")
     st.caption("v9 — physics-informed moisture model + 4-knob cost optimizer")
     st.markdown("---")
-    st.markdown("**Quality spec**")
-    st.write(f"Moisture target: {MOISTURE_SPEC_LO}% – {MOISTURE_SPEC_HI}% (P90 constrained)")
-    st.markdown("**Safety floor**")
-    st.write(f"Tower inlet temp ≥ {T_INLET_MIN:.0f} °C")
+    
+    st.markdown("**Data Subset for Dashboard**")
+    data_subset = st.radio(
+        "View predictions from:",
+        options=["All steady-state data", "Last 20,000 rows", "By month"],
+        index=0,
+        help="Switch between different data slices to see model performance vary"
+    )
+    
+    if data_subset == "All steady-state data":
+        display_sample = sample
+        subset_desc = "All steady-state (18,542 rows)"
+    elif data_subset == "Last 20,000 rows":
+        display_sample = sample.tail(20000)
+        subset_desc = "Recent data (last 20,000 rows)"
+    else:  # By month
+        month_sel = st.selectbox("Pick a month:", 
+                                  sorted(sample['month'].unique(), reverse=True),
+                                  format_func=lambda x: str(x))
+        display_sample = sample[sample['month'] == month_sel]
+        subset_desc = f"Month: {month_sel}"
+    
+    st.caption(f"**Current:** {subset_desc}")
     st.markdown("---")
-    st.markdown("**Operating point source**")
-    ts_options = sample["Time and date"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
-    sel = st.selectbox("Pick a historical snapshot", options=list(range(len(sample))),
-                        index=st.session_state.base_idx,
-                        format_func=lambda i: ts_options[i])
+    ts_options = display_sample["Time and date"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+    sel = st.selectbox("Pick a snapshot from current subset:", 
+                        options=list(range(len(display_sample))),
+                        index=min(st.session_state.base_idx, len(display_sample)-1),
+                        format_func=lambda i: ts_options[i] if i < len(ts_options) else "N/A")
     if sel != st.session_state.base_idx:
-        set_base(sel)
-    if st.button("↻ Jump to latest reading", use_container_width=True):
-        set_base(len(sample) - 1)
+        st.session_state.base_idx = sel
+        st.session_state.ca = float(display_sample.iloc[sel]["CA_Fan_Speed"])
+        st.session_state.hp = float(display_sample.iloc[sel]["Combind_HP_Pump_Speed"])
+        st.session_state.gr = float(display_sample.iloc[sel]["Tower_Grade_Speed_Hz"]) if grate_present else 14.0
+        st.session_state.fd_base = float(display_sample.iloc[sel]["FD_Fan_speed"])
+        st.session_state.ca_base = float(display_sample.iloc[sel]["CA_Fan_Speed"])
+        st.session_state.accept_msg = None
+    if st.button("↻ Jump to latest in subset", use_container_width=True):
+        st.session_state.base_idx = len(display_sample) - 1
+        row_latest = display_sample.iloc[-1]
+        st.session_state.ca = float(row_latest["CA_Fan_Speed"])
+        st.session_state.hp = float(row_latest["Combind_HP_Pump_Speed"])
+        st.session_state.gr = float(row_latest["Tower_Grade_Speed_Hz"]) if grate_present else 14.0
+        st.session_state.fd_base = float(row_latest["FD_Fan_speed"])
+        st.session_state.ca_base = float(row_latest["CA_Fan_Speed"])
+        st.session_state.accept_msg = None
+        st.rerun()
     st.markdown("---")
     st.caption("Model: LightGBM · Walk-forward validated")
     st.caption(f"Held-out MAE range: {wf_df['mae'].min():.2f}% – {wf_df['mae'].max():.2f}%")
 
-base_row = sample.iloc[st.session_state.base_idx]
+base_row = display_sample.iloc[st.session_state.base_idx]
 
 tab1, tab2, tab3 = st.tabs(["📊 Live Monitor", "🎛️ Optimizer & Recommendations", "📈 Model Performance"])
 
@@ -525,14 +559,14 @@ with tab3:
         st.plotly_chart(figimp, use_container_width=True)
 
     st.markdown("---")
-    st.markdown("#### Predicted (P50) vs actual — sample window")
-    X_all = sample[features].values
-    p50_all = qmodels[0.50].predict(X_all)
-    p90_all = qmodels[0.90].predict(X_all)
-    in_spec = (p90_all <= MOISTURE_SPEC_HI) & (p50_all >= MOISTURE_SPEC_LO)
+    st.markdown("#### Predicted (P50) vs actual — current data subset")
+    X_subset = display_sample[features].values
+    p50_subset = qmodels[0.50].predict(X_subset)
+    p90_subset = qmodels[0.90].predict(X_subset)
+    in_spec = (p90_subset <= MOISTURE_SPEC_HI) & (p50_subset >= MOISTURE_SPEC_LO)
     scatter_df = pd.DataFrame({
-        "Actual": sample["Tower_Powder_Moisture"].values,
-        "Predicted (P50)": p50_all,
+        "Actual": display_sample["Tower_Powder_Moisture"].values,
+        "Predicted (P50)": p50_subset,
         "In spec": np.where(in_spec, "In spec", "Out of spec"),
     })
     figsc = px.scatter(scatter_df, x="Actual", y="Predicted (P50)", color="In spec",
@@ -543,13 +577,14 @@ with tab3:
     figsc.update_layout(height=420, margin=dict(l=10, r=10, t=20, b=10))
     st.plotly_chart(figsc, use_container_width=True)
 
-    mae_all = float(np.mean(np.abs(scatter_df["Actual"] - scatter_df["Predicted (P50)"])))
-    coverage = float(((sample["Tower_Powder_Moisture"] >= qmodels[0.10].predict(X_all)) &
-                       (sample["Tower_Powder_Moisture"] <= p90_all)).mean())
+    mae_subset = float(np.mean(np.abs(scatter_df["Actual"] - scatter_df["Predicted (P50)"])))
+    p10_subset = qmodels[0.10].predict(X_subset)
+    coverage = float(((display_sample["Tower_Powder_Moisture"].values >= p10_subset) &
+                       (display_sample["Tower_Powder_Moisture"].values <= p90_subset)).mean())
     m1, m2, m3 = st.columns(3)
-    m1.metric("Sample MAE", f"{mae_all:.3f}%")
+    m1.metric("MAE (this subset)", f"{mae_subset:.3f}%")
     m2.metric("P10–P90 coverage", f"{100*coverage:.1f}%", help="Target ≈ 80% for a calibrated band")
-    m3.metric("Rows in sample", f"{len(sample):,}")
+    m3.metric("Rows in subset", f"{len(display_sample):,}")
 
     st.markdown("---")
     st.markdown("""
